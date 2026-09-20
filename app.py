@@ -16,9 +16,155 @@ PORT = int(os.getenv("BETSPORTS_PORT", "5050"))
 HOST = os.getenv("BETSPORTS_HOST", "0.0.0.0")
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": os.getenv("BETSPORTS_ALLOWED_ORIGINS", "*")}}, supports_credentials=True)
+CORS(app, resources={r"/*": {"origins": os.getenv("BETSPORTS_ALLOWED_ORIGINS", "*")}}, supports_credentials=True)
 
 SPORTS = ["football", "basketball", "cricket", "tennis", "rugby", "baseball", "icehockey", "volleyball", "ufc", "mma", "nfl", "nba"]
+
+
+# Supabase-compatible bridge for the existing static frontend.
+# It lets the imported UI use this separate Flask/SQLite service without a hosted Supabase dependency.
+def _supabase_user(user):
+    if not user:
+        return None
+    name = (user["name"] or "").strip()
+    parts = name.split(" ", 1)
+    return {
+        "id": str(user["id"]),
+        "aud": "authenticated",
+        "role": "authenticated",
+        "email": user["email"],
+        "phone": user["phone"] or "",
+        "email_confirmed_at": user["created_at"],
+        "created_at": user["created_at"],
+        "updated_at": user["created_at"],
+        "user_metadata": {"first_name": parts[0] if parts else "", "last_name": parts[1] if len(parts) > 1 else "", "phone": user["phone"] or ""},
+        "app_metadata": {"provider": "email", "providers": ["email"], "role": "user"},
+    }
+
+def _supabase_session(user):
+    token = secrets.token_urlsafe(32)
+    db().execute("INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)", (token, user["id"], utc_now()))
+    db().commit()
+    return {"access_token": token, "refresh_token": token, "token_type": "bearer", "expires_in": 31536000, "expires_at": int(datetime.now(timezone.utc).timestamp()) + 31536000, "user": _supabase_user(user)}
+
+def _auth_user_from_request():
+    return current_user()
+
+@app.post("/auth/v1/signup")
+def supabase_signup():
+    body = request.get_json(silent=True) or {}
+    options = body.get("options") or {}
+    metadata = options.get("data") or {}
+    email = str(body.get("email") or "").strip().lower()
+    password = str(body.get("password") or "")
+    if not email or len(password) < 6:
+        return jsonify({"error": "invalid_credentials", "error_description": "A valid email and password of at least 6 characters are required."}), 400
+    existing = db().execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+    if existing:
+        return jsonify({"code": "user_already_exists", "msg": "User already registered"}), 422
+    name = " ".join(filter(None, [str(metadata.get("first_name") or "").strip(), str(metadata.get("last_name") or "").strip()])) or email.split("@", 1)[0]
+    connection = db()
+    connection.execute("INSERT INTO users (name, email, phone, password_hash, created_at) VALUES (?, ?, ?, ?, ?)", (name, email, metadata.get("phone"), generate_password_hash(password), utc_now()))
+    connection.commit()
+    user = connection.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    return jsonify(_supabase_session(user)), 200
+
+@app.post("/auth/v1/token")
+def supabase_token():
+    body = request.get_json(silent=True) or {}
+    grant = body.get("grant_type")
+    if grant == "refresh_token":
+        token = body.get("refresh_token") or ""
+        user = db().execute("SELECT u.* FROM users u JOIN sessions s ON s.user_id = u.id WHERE s.token = ?", (token,)).fetchone()
+        if user:
+            return jsonify(_supabase_session(user))
+    email = str(body.get("email") or "").strip().lower()
+    password = str(body.get("password") or "")
+    user = db().execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    if user is None or not check_password_hash(user["password_hash"], password):
+        return jsonify({"error": "invalid_grant", "error_description": "Invalid login credentials"}), 400
+    return jsonify(_supabase_session(user))
+
+@app.get("/auth/v1/user")
+def supabase_user():
+    user = _auth_user_from_request()
+    if not user:
+        return jsonify({"error": "invalid_token", "error_description": "User not found"}), 401
+    return jsonify(_supabase_user(user))
+
+@app.post("/auth/v1/logout")
+def supabase_logout():
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.lower().startswith("bearer ") else ""
+    if token:
+        db().execute("DELETE FROM sessions WHERE token = ?", (token,))
+        db().commit()
+    return ("", 204)
+
+def _frontend_profile(user):
+    profile = _supabase_user(user)
+    metadata = profile["user_metadata"]
+    return {"id": str(user["id"]), "email": user["email"], "first_name": metadata.get("first_name", ""), "last_name": metadata.get("last_name", ""), "phone": user["phone"] or "", "role": "USER", "country": "GH", "currency": "GHS", "balance": 0, "kyc_status": "verified", "created_at": user["created_at"], "updated_at": user["created_at"]}
+
+def _rest_rows(table):
+    user = _auth_user_from_request()
+    if table == "profiles":
+        return [_frontend_profile(user)] if user else []
+    if table == "matches":
+        rows = []
+        for sport in SPORTS:
+            for state in ("live", "upcoming"):
+                for match in matches_for(sport, state):
+                    rows.append({"id": match["id"], "sport": sport, "league": match["league"], "home_team": match["homeTeam"]["name"], "away_team": match["awayTeam"]["name"], "home_team_id": match["homeTeam"]["id"], "away_team_id": match["awayTeam"]["id"], "status": match["status"], "is_live": match["isLive"], "start_time": match["startTime"], "home_odds": match["odds"]["home"], "draw_odds": match["odds"]["draw"], "away_odds": match["odds"]["away"], "home_score": match["score"]["home"], "away_score": match["score"]["away"]})
+        return rows
+    if table == "promotions":
+        return [{"id": "welcome-200", "title": "Welcome bonus", "description": "Up to 200% extra on your first qualifying slip", "active": True}, {"id": "weekly-500", "title": "Weekly accumulator", "description": "Boosted returns on selected accumulators", "active": True}]
+    if table in {"settings", "banners", "leagues", "teams", "markets", "market_selections", "bet_selections", "transactions", "wallet_transactions", "withdrawal_requests", "support_tickets", "flutterwave_accounts", "sub_admin_invites", "sub_admin_payouts", "admin_platform_metrics_summary"}:
+        return []
+    if table == "bets" and user:
+        rows = db().execute("SELECT * FROM bets WHERE user_id = ? ORDER BY created_at DESC", (user["id"],)).fetchall()
+        return [dict(row) for row in rows]
+    if table == "booking_codes" and user:
+        rows = db().execute("SELECT booking_code AS code, booking_code, total_odds, stake, status, created_at FROM bets WHERE user_id = ? ORDER BY created_at DESC", (user["id"],)).fetchall()
+        return [dict(row) for row in rows]
+    return []
+
+def _apply_rest_filters(rows):
+    for key, values in request.args.items(multi=True):
+        if key in {"select", "order", "limit", "offset"}:
+            continue
+        if "=" in values:
+            op, value = values.split("=", 1)
+            if op == "eq": rows = [r for r in rows if str(r.get(key, "")) == value]
+            elif op == "neq": rows = [r for r in rows if str(r.get(key, "")) != value]
+            elif op == "in": rows = [r for r in rows if str(r.get(key, "")) in value.strip("()").split(",")]
+    order = request.args.get("order")
+    if order:
+        key, _, direction = order.partition(".")
+        rows = sorted(rows, key=lambda r: str(r.get(key, "")), reverse=direction == "desc")
+    try:
+        offset = int(request.args.get("offset", 0)); limit = request.args.get("limit")
+        rows = rows[offset: offset + int(limit) if limit else None]
+    except ValueError:
+        pass
+    return rows
+
+@app.route("/rest/v1/<table>", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
+def supabase_rest(table):
+    rows = _apply_rest_filters(_rest_rows(table))
+    if request.method == "GET":
+        if request.headers.get("Accept") == "application/vnd.pgrst.object+json" or request.args.get("select") and request.args.get("limit") == "1":
+            return (jsonify(rows[0]) if rows else jsonify({"code": "PGRST116", "message": "JSON object requested, multiple (or no) rows returned"})), (200 if rows else 406)
+        response = jsonify(rows)
+        response.headers["Content-Range"] = f"0-{max(len(rows)-1, 0)}/*"
+        return response
+    # Public frontend writes are mapped to the first-party API where possible.
+    if table == "profiles" and request.method in {"PATCH", "PUT"} and current_user():
+        body = request.get_json(silent=True) or {}
+        db().execute("UPDATE users SET name = ?, phone = ? WHERE id = ?", (body.get("full_name") or body.get("name") or current_user()["name"], body.get("phone", current_user()["phone"]), current_user()["id"]))
+        db().commit()
+        return jsonify([_frontend_profile(current_user())])
+    return jsonify([]), 201 if request.method in {"POST", "PUT", "PATCH"} else 204
 
 
 def utc_now():
