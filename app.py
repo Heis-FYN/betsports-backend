@@ -23,6 +23,7 @@ DB_PATH = Path(os.getenv("BETSPORTS_DB", BASE_DIR / "betsports.db"))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PORT = int(os.getenv("BETSPORTS_PORT", "5050"))
 HOST = os.getenv("BETSPORTS_HOST", "0.0.0.0")
+ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("BETSPORTS_ALLOWED_ORIGINS", "https://betsports-frontend-netlify.netlify.app,http://localhost:5173").split(",") if origin.strip()]
 
 
 class DatabaseAdapter:
@@ -42,7 +43,7 @@ class DatabaseAdapter:
         return self.connection.close()
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": os.getenv("BETSPORTS_ALLOWED_ORIGINS", "*")}}, supports_credentials=True)
+CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 
 SPORTS = ["football", "basketball", "cricket", "tennis", "rugby", "baseball", "icehockey", "volleyball", "ufc", "mma", "nfl", "nba"]
 
@@ -64,7 +65,7 @@ def _supabase_user(user):
         "created_at": user["created_at"],
         "updated_at": user["created_at"],
         "user_metadata": {"first_name": parts[0] if parts else "", "last_name": parts[1] if len(parts) > 1 else "", "phone": user["phone"] or ""},
-        "app_metadata": {"provider": "email", "providers": ["email"], "role": "user"},
+        "app_metadata": {"provider": "email", "providers": ["email"], "role": (user["role"] or "USER").lower()},
     }
 
 def _supabase_session(user):
@@ -377,13 +378,17 @@ def scalar(row):
 
 
 def current_user():
-    auth = request.headers.get("Authorization", "")
-    token = auth[7:] if auth.lower().startswith("bearer ") else request.cookies.get("betsports_token")
+    token = request_token()
     if not token:
         return None
     return db().execute(
         "SELECT u.* FROM users u JOIN sessions s ON s.user_id = u.id WHERE s.token = ?", (token,)
     ).fetchone()
+
+
+def request_token():
+    auth = request.headers.get("Authorization", "")
+    return auth[7:].strip() if auth.lower().startswith("bearer ") else request.cookies.get("betsports_token")
 
 
 def auth_required(handler):
@@ -513,13 +518,32 @@ def me():
 @app.post("/api/auth/logout")
 @auth_required
 def logout():
-    auth = request.headers.get("Authorization", "")
-    token = auth[7:] if auth.lower().startswith("bearer ") else request.cookies.get("betsports_token")
+    token = request_token()
     db().execute("DELETE FROM sessions WHERE token = ?", (token,))
     db().commit()
     response = jsonify({"ok": True, "data": {"loggedOut": True}})
     response.delete_cookie("betsports_token")
     return response
+
+
+@app.post("/api/auth/change-password")
+@auth_required
+def change_password():
+    body = request.get_json(silent=True) or {}
+    current_password = str(body.get("currentPassword") or body.get("current_password") or "")
+    new_password = str(body.get("newPassword") or body.get("new_password") or "")
+    if not check_password_hash(g.user["password_hash"], current_password):
+        return json_error("Current password is incorrect", 401, "invalid_current_password")
+    if len(new_password) < 10:
+        return json_error("New password must be at least 10 characters", 400, "weak_password")
+    if check_password_hash(g.user["password_hash"], new_password):
+        return json_error("New password must be different from the current password", 400, "same_password")
+    connection = db()
+    connection.execute("UPDATE users SET password_hash = ?, force_password_change = 0 WHERE id = ?", (generate_password_hash(new_password), g.user["id"]))
+    current_token = request_token()
+    connection.execute("DELETE FROM sessions WHERE user_id = ? AND token != ?", (g.user["id"], current_token))
+    connection.commit()
+    return json_ok({"changed": True, "sessionsRevoked": True})
 
 
 @app.get("/api/user/profile")
@@ -651,7 +675,7 @@ def bet_slip():
         odds = float(body.get("odds") or 1)
         if not match_id or not selection:
             return json_error("matchId and selection are required")
-            connection.execute("INSERT INTO bet_slips (user_id, match_id, selection, odds, stake, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (user_id, match_id, selection) DO UPDATE SET odds = EXCLUDED.odds, stake = EXCLUDED.stake, created_at = EXCLUDED.created_at", (g.user["id"], match_id, selection, odds, float(body.get("stake") or 0), utc_now()))
+        connection.execute("INSERT INTO bet_slips (user_id, match_id, selection, odds, stake, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (user_id, match_id, selection) DO UPDATE SET odds = EXCLUDED.odds, stake = EXCLUDED.stake, created_at = EXCLUDED.created_at", (g.user["id"], match_id, selection, odds, float(body.get("stake") or 0), utc_now()))
     connection.commit()
     return json_ok({"updated": True})
 
