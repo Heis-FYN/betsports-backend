@@ -3,6 +3,9 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -45,7 +48,28 @@ class DatabaseAdapter:
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 
-SPORTS = ["football", "basketball", "cricket", "tennis", "rugby", "baseball", "icehockey", "volleyball", "ufc", "mma", "nfl", "nba"]
+SPORTS = ["football", "basketball", "cricket", "tennis", "rugby", "baseball", "icehockey", "volleyball", "ufc", "mma", "golf", "motorsports", "soccer"]
+
+# Backend-only catalog. Public responses contain only normalized match fields.
+ESPN_LEAGUE_CATALOG = {
+    "football": ["nfl", "college-football", "cfl", "ufl"],
+    "basketball": ["nba", "wnba", "mens-college-basketball", "womens-college-basketball"],
+    "baseball": ["mlb", "college-baseball"],
+    "icehockey": ["nhl", "mens-college-hockey"],
+    "soccer": ["eng.1", "esp.1", "ger.1", "ita.1", "fra.1", "uefa.champions", "uefa.europa", "usa.1", "mex.1"],
+    "tennis": ["atp", "wta"],
+    "golf": ["pga", "lpga"],
+    "motorsports": ["f1"],
+    "rugby": ["rugby"],
+    "cricket": ["international"],
+    "volleyball": ["fivb"],
+    "ufc": ["ufc"],
+}
+ESPN_SPORT_PATH = {"icehockey": "hockey", "motorsports": "racing", "ufc": "mma", "mma": "mma"}
+ESPN_CACHE_SECONDS = int(os.getenv("ESPN_CACHE_SECONDS", "300"))
+ESPN_TIMEOUT_SECONDS = float(os.getenv("ESPN_TIMEOUT_SECONDS", "8"))
+_espn_cache = {}
+_espn_cache_lock = threading.Lock()
 
 
 # Supabase-compatible bridge for the existing static frontend.
@@ -428,8 +452,93 @@ def make_match(sport, index, state="upcoming"):
     }
 
 
+def _espn_status(event):
+    status = ((event.get("competitions") or [{}])[0].get("status") or event.get("status") or {})
+    state = str(status.get("type", {}).get("state") or status.get("state") or "pre").lower()
+    if state in {"post", "final", "completed"}: return "finished"
+    if state in {"in", "live", "inprogress"}: return "live"
+    if state in {"canceled", "cancelled", "suspended", "postponed"}: return "suspended"
+    return "upcoming"
+
+
+def _espn_number(value, fallback):
+    try: return float(value)
+    except (TypeError, ValueError): return fallback
+
+
+def _espn_event_to_match(event, sport, league):
+    competitions = event.get("competitions") or []
+    competition = competitions[0] if competitions else {}
+    competitors = competition.get("competitors") or []
+    home = next((item for item in competitors if item.get("homeAway") == "home"), competitors[0] if competitors else {})
+    away = next((item for item in competitors if item.get("homeAway") == "away"), competitors[1] if len(competitors) > 1 else {})
+    home_team = home.get("team") or {}
+    away_team = away.get("team") or {}
+    event_id = str(event.get("id") or competition.get("id") or "")
+    if not event_id or not home_team.get("displayName") or not away_team.get("displayName"):
+        return None
+    state = _espn_status(event)
+    home_score = int(float(home.get("score") or 0)) if str(home.get("score") or "0").replace('.', '', 1).isdigit() else 0
+    away_score = int(float(away.get("score") or 0)) if str(away.get("score") or "0").replace('.', '', 1).isdigit() else 0
+    odds = {"home": 1.5, "draw": 3.2, "away": 2.15}
+    event_odds = competition.get("odds") or []
+    if event_odds:
+        first = event_odds[0] or {}
+        odds["home"] = _espn_number(first.get("homeTeamOdds", {}).get("moneyLine") or first.get("homeMoneyLine"), odds["home"])
+        odds["away"] = _espn_number(first.get("awayTeamOdds", {}).get("moneyLine") or first.get("awayMoneyLine"), odds["away"])
+    opaque_id = "m-" + hashlib.sha256(f"{sport}:{league}:{event_id}".encode()).hexdigest()[:20]
+    return {
+        "id": opaque_id, "sport": sport, "league": (event.get("league") or {}).get("name") or league,
+        "homeTeam": {"id": str(home_team.get("id") or f"{event_id}-home"), "name": home_team.get("displayName"), "shortName": home_team.get("shortDisplayName") or home_team.get("abbreviation") or home_team.get("displayName", "Home")[:3].upper()},
+        "awayTeam": {"id": str(away_team.get("id") or f"{event_id}-away"), "name": away_team.get("displayName"), "shortName": away_team.get("shortDisplayName") or away_team.get("abbreviation") or away_team.get("displayName", "Away")[:3].upper()},
+        "startTime": event.get("date") or utc_now(), "status": state,
+        "score": {"home": home_score, "away": away_score}, "odds": odds, "isLive": state == "live", "featured": False,
+    }
+
+
+def _fetch_espn_league(sport, league):
+    url = f"https://site.api.espn.com/apis/site/v2/sports/{ESPN_SPORT_PATH.get(sport, sport)}/{league}/scoreboard"
+    try:
+        request = Request(url, headers={"User-Agent": "MaxWin match service/1.0", "Accept": "application/json"})
+        with urlopen(request, timeout=ESPN_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return [_espn_event_to_match(event, sport, league) for event in payload.get("events", [])]
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+        return []
+
+
+def _upsert_ingested_match(match):
+    connection = db()
+    existing = connection.execute("SELECT id FROM matches WHERE id = ?", (match["id"],)).fetchone()
+    values = (match["sport"], match["league"], match["homeTeam"]["name"], match["awayTeam"]["name"], match["startTime"], match["status"], match["odds"]["home"], match["odds"]["draw"], match["odds"]["away"], match["score"]["home"], match["score"]["away"], utc_now())
+    if existing:
+        connection.execute("UPDATE matches SET sport = ?, league = ?, home_team = ?, away_team = ?, start_time = ?, status = ?, home_odds = ?, draw_odds = ?, away_odds = ?, home_score = ?, away_score = ?, updated_at = ? WHERE id = ?", (*values, match["id"]))
+    else:
+        connection.execute("INSERT INTO matches (id, sport, league, home_team, away_team, start_time, status, home_odds, draw_odds, away_odds, home_score, away_score, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (match["id"], *values[:-1], utc_now(), values[-1]))
+
+
+def sync_espn_sport(sport, force=False):
+    now = datetime.now(timezone.utc).timestamp()
+    with _espn_cache_lock:
+        cached = _espn_cache.get(sport)
+        if not force and cached and now - cached < ESPN_CACHE_SECONDS:
+            return
+        _espn_cache[sport] = now
+    leagues = ESPN_LEAGUE_CATALOG.get(sport, [])
+    for league in leagues:
+        for match in _fetch_espn_league(sport, league):
+            if match:
+                _upsert_ingested_match(match)
+    db().commit()
+
+
 def matches_for(sport, status="upcoming"):
     normalized = "live" if status in ("live", "in-play") else "upcoming"
+    if sport in ESPN_LEAGUE_CATALOG:
+        sync_espn_sport(sport)
+    stored = db().execute("SELECT * FROM matches WHERE sport = ? AND status = ? ORDER BY start_time ASC LIMIT 300", (sport, normalized)).fetchall()
+    if stored:
+        return [stored_match_to_public(row) for row in stored]
     return [make_match(sport, i, normalized) for i in range(3)]
 
 
@@ -570,8 +679,6 @@ def sport_matches(sport, status):
         return json_error("Unsupported sport", 404, "sport_not_found")
     state = "live" if "live" in status else "upcoming"
     data = matches_for(sport, state)
-    stored = db().execute("SELECT * FROM matches WHERE sport = ? AND status = ? ORDER BY start_time ASC", (sport, state)).fetchall()
-    data = [stored_match_to_public(row) for row in stored] + data
     return json_ok(data, count=len(data), sport=sport, status=state)
 
 
@@ -977,6 +1084,18 @@ def admin_review_request(request_id, action):
     audit(f"{action}_{item['request_type']}", "wallet_request", request_id, {"amount": item["amount"], "provider": "disabled"})
     connection.commit()
     return json_ok({"requestId": request_id, "status": new_status})
+
+
+@app.post("/api/admin/sync-matches")
+@admin_required
+def admin_sync_matches():
+    sport = str((request.get_json(silent=True) or {}).get("sport") or "").strip().lower()
+    targets = [sport] if sport in ESPN_LEAGUE_CATALOG else list(ESPN_LEAGUE_CATALOG)
+    for target in targets:
+        sync_espn_sport(target, force=True)
+    audit("sync_matches", "match_feed", sport or "all", {"sports": targets})
+    db().commit()
+    return json_ok({"sports": targets, "status": "synced"})
 
 
 @app.get("/api/admin/matches")
