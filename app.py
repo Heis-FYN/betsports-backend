@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import secrets
 import sqlite3
@@ -104,7 +105,7 @@ def supabase_logout():
 def _frontend_profile(user):
     profile = _supabase_user(user)
     metadata = profile["user_metadata"]
-    return {"id": str(user["id"]), "email": user["email"], "first_name": metadata.get("first_name", ""), "last_name": metadata.get("last_name", ""), "phone": user["phone"] or "", "role": "USER", "country": "GH", "currency": "GHS", "balance": 0, "kyc_status": "verified", "created_at": user["created_at"], "updated_at": user["created_at"]}
+    return {"id": str(user["id"]), "email": user["email"], "first_name": metadata.get("first_name", ""), "last_name": metadata.get("last_name", ""), "phone": user["phone"] or "", "role": user["role"] or "USER", "country": "GH", "currency": "GHS", "balance": float(user["balance"] or 0), "kyc_status": "verified", "created_at": user["created_at"], "updated_at": user["created_at"]}
 
 def _rest_rows(table):
     user = _auth_user_from_request()
@@ -196,6 +197,9 @@ def init_db():
             email TEXT NOT NULL UNIQUE,
             phone TEXT,
             password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'USER',
+            balance REAL NOT NULL DEFAULT 0,
+            force_password_change INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS sessions (
@@ -220,6 +224,9 @@ def init_db():
             selections_json TEXT NOT NULL,
             total_odds REAL NOT NULL,
             stake REAL NOT NULL,
+            possible_win REAL NOT NULL DEFAULT 0,
+            payout REAL NOT NULL DEFAULT 0,
+            result TEXT NOT NULL DEFAULT 'open',
             status TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
@@ -231,8 +238,74 @@ def init_db():
             created_at TEXT NOT NULL,
             UNIQUE(user_id, item_type, item_id)
         );
+        CREATE TABLE IF NOT EXISTS matches (
+            id TEXT PRIMARY KEY,
+            sport TEXT NOT NULL,
+            league TEXT NOT NULL,
+            home_team TEXT NOT NULL,
+            away_team TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'upcoming',
+            home_odds REAL NOT NULL DEFAULT 1.5,
+            draw_odds REAL NOT NULL DEFAULT 3.2,
+            away_odds REAL NOT NULL DEFAULT 2.15,
+            home_score INTEGER NOT NULL DEFAULT 0,
+            away_score INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS wallet_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            request_type TEXT NOT NULL CHECK(request_type IN ('deposit','withdrawal')),
+            amount REAL NOT NULL CHECK(amount > 0),
+            method TEXT NOT NULL DEFAULT 'manual',
+            reference TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            note TEXT,
+            reviewed_by INTEGER REFERENCES users(id),
+            reviewed_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS wallet_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            request_id INTEGER REFERENCES wallet_requests(id),
+            amount REAL NOT NULL,
+            balance_after REAL NOT NULL,
+            entry_type TEXT NOT NULL,
+            note TEXT,
+            created_by INTEGER REFERENCES users(id),
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS admin_audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL REFERENCES users(id),
+            action TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id TEXT,
+            details_json TEXT,
+            created_at TEXT NOT NULL
+        );
         """
     )
+    # Backfill columns for databases created by earlier BetSports versions.
+    existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(users)").fetchall()}
+    for column, definition in (("role", "TEXT NOT NULL DEFAULT 'USER'"), ("balance", "REAL NOT NULL DEFAULT 0"), ("force_password_change", "INTEGER NOT NULL DEFAULT 0")):
+        if column not in existing_columns:
+            connection.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+    bet_columns = {row[1] for row in connection.execute("PRAGMA table_info(bets)").fetchall()}
+    for column, definition in (("possible_win", "REAL NOT NULL DEFAULT 0"), ("payout", "REAL NOT NULL DEFAULT 0"), ("result", "TEXT NOT NULL DEFAULT 'open'")):
+        if column not in bet_columns:
+            connection.execute(f"ALTER TABLE bets ADD COLUMN {column} {definition}")
+    admin_email_raw = os.getenv("BETSPORTS_ADMIN_EMAIL", "Citydeity1@gmail.com").strip()
+    admin_email = admin_email_raw.lower()
+    admin_password = os.getenv("BETSPORTS_ADMIN_INITIAL_PASSWORD", admin_email_raw)
+    admin = connection.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone()
+    if admin is None:
+        connection.execute("INSERT INTO users (name, email, password_hash, role, force_password_change, created_at) VALUES (?, ?, ?, 'ADMIN', 1, ?)", ("MaxWin Administrator", admin_email, generate_password_hash(admin_password), utc_now()))
+    else:
+        connection.execute("UPDATE users SET role = 'ADMIN' WHERE email = ?", (admin_email,))
     connection.commit()
     connection.close()
 
@@ -303,6 +376,18 @@ def matches_for(sport, status="upcoming"):
     return [make_match(sport, i, normalized) for i in range(3)]
 
 
+def stored_match_to_public(row):
+    return {
+        "id": row["id"], "sport": row["sport"], "league": row["league"],
+        "homeTeam": {"id": f"{row['id']}-home", "name": row["home_team"], "shortName": row["home_team"][:3].upper()},
+        "awayTeam": {"id": f"{row['id']}-away", "name": row["away_team"], "shortName": row["away_team"][:3].upper()},
+        "startTime": row["start_time"], "status": row["status"],
+        "score": {"home": row["home_score"], "away": row["away_score"]},
+        "odds": {"home": row["home_odds"], "draw": row["draw_odds"], "away": row["away_odds"]},
+        "isLive": row["status"] == "live", "featured": False,
+    }
+
+
 @app.get("/health")
 def health():
     db().execute("SELECT 1").fetchone()
@@ -363,7 +448,7 @@ def _session_response(user):
 
 
 def _public_user(user):
-    return {"id": user["id"], "name": user["name"], "email": user["email"], "phone": user["phone"], "createdAt": user["created_at"]}
+    return {"id": user["id"], "name": user["name"], "email": user["email"], "phone": user["phone"], "role": user["role"] if "role" in user.keys() else "USER", "balance": float(user["balance"] or 0) if "balance" in user.keys() else 0, "forcePasswordChange": bool(user["force_password_change"]) if "force_password_change" in user.keys() else False, "createdAt": user["created_at"]}
 
 
 @app.get("/api/auth/me")
@@ -408,6 +493,8 @@ def sport_matches(sport, status):
         return json_error("Unsupported sport", 404, "sport_not_found")
     state = "live" if "live" in status else "upcoming"
     data = matches_for(sport, state)
+    stored = db().execute("SELECT * FROM matches WHERE sport = ? AND status = ? ORDER BY start_time ASC", (sport, state)).fetchall()
+    data = [stored_match_to_public(row) for row in stored] + data
     return json_ok(data, count=len(data), sport=sport, status=state)
 
 
@@ -416,6 +503,11 @@ def sport_matches(sport, status):
 def sport_match_detail(sport, match_id):
     if sport not in SPORTS:
         return json_error("Unsupported sport", 404, "sport_not_found")
+    if match_id in {"live", "upcoming", "in-play"}:
+        return sport_matches(sport, match_id)
+    stored = db().execute("SELECT * FROM matches WHERE id = ? AND sport = ?", (match_id, sport)).fetchone()
+    if stored:
+        return json_ok(stored_match_to_public(stored))
     return json_ok(make_match(sport, abs(hash(match_id)) % 3, "live" if "live" in match_id else "upcoming"))
 
 
@@ -530,9 +622,10 @@ def place_bet():
     booking_code = "BS-" + secrets.token_hex(4).upper()
     total_odds = _total_odds(selections)
     connection = db()
-    connection.execute("INSERT INTO bets (user_id, booking_code, selections_json, total_odds, stake, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (g.user["id"], booking_code, __import__("json").dumps(selections), total_odds, stake, "accepted-demo", utc_now()))
+    possible_win = round(total_odds * stake, 2)
+    connection.execute("INSERT INTO bets (user_id, booking_code, selections_json, total_odds, stake, possible_win, payout, result, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, 'open', ?, ?)", (g.user["id"], booking_code, json.dumps(selections), total_odds, stake, possible_win, "accepted-demo", utc_now()))
     connection.commit()
-    return json_ok({"bookingCode": booking_code, "status": "accepted-demo", "totalOdds": round(total_odds, 2), "possibleWin": round(total_odds * stake, 2)}), 201
+    return json_ok({"bookingCode": booking_code, "status": "accepted-demo", "totalOdds": round(total_odds, 2), "possibleWin": possible_win}), 201
 
 
 @app.route("/api/booking-codes", methods=["GET", "POST"])
@@ -552,6 +645,292 @@ def booking_codes():
 def phone_lookup():
     phone = request.args.get("phone", "")
     return json_ok({"phone": phone, "available": True})
+
+
+
+def admin_current_user():
+    user = current_user()
+    if user is None or (user["role"] or "USER").upper() not in {"ADMIN", "SUPER_ADMIN"}:
+        return None
+    return user
+
+
+def admin_required(handler):
+    @wraps(handler)
+    def wrapped(*args, **kwargs):
+        user = admin_current_user()
+        if user is None:
+            return json_error("Administrator authentication required", 401, "admin_unauthorized")
+        g.admin = user
+        return handler(*args, **kwargs)
+    return wrapped
+
+
+def audit(action, entity_type, entity_id=None, details=None):
+    db().execute("INSERT INTO admin_audit_log (admin_id, action, entity_type, entity_id, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", (g.admin["id"], action, entity_type, str(entity_id) if entity_id is not None else None, json.dumps(details or {}), utc_now()))
+
+
+def admin_user_dict(row):
+    result = row_to_dict(row)
+    if result:
+        result["force_password_change"] = bool(result.get("force_password_change"))
+        result["balance"] = float(result.get("balance") or 0)
+    return result
+
+
+@app.post("/api/admin/auth/login")
+def admin_login():
+    body = request.get_json(silent=True) or {}
+    email = str(body.get("email") or "").strip().lower()
+    password = str(body.get("password") or "")
+    user = db().execute("SELECT * FROM users WHERE email = ? AND upper(role) IN ('ADMIN', 'SUPER_ADMIN')", (email,)).fetchone()
+    if user is None or not check_password_hash(user["password_hash"], password):
+        return json_error("Invalid administrator credentials", 401, "invalid_admin_credentials")
+    token = secrets.token_urlsafe(40)
+    db().execute("INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)", (token, user["id"], utc_now()))
+    db().commit()
+    return json_ok({"token": token, "admin": admin_user_dict(user), "mustChangePassword": bool(user["force_password_change"])})
+
+
+@app.post("/api/admin/auth/change-password")
+@admin_required
+def admin_change_password():
+    body = request.get_json(silent=True) or {}
+    password = str(body.get("password") or "")
+    if len(password) < 10:
+        return json_error("Password must be at least 10 characters", 400, "weak_password")
+    db().execute("UPDATE users SET password_hash = ?, force_password_change = 0 WHERE id = ?", (generate_password_hash(password), g.admin["id"]))
+    audit("change_password", "admin", g.admin["id"])
+    db().commit()
+    return json_ok({"changed": True})
+
+
+@app.get("/api/admin/auth/me")
+@admin_required
+def admin_me():
+    return json_ok({"admin": admin_user_dict(g.admin), "mustChangePassword": bool(g.admin["force_password_change"])})
+
+
+@app.post("/api/admin/auth/logout")
+@admin_required
+def admin_logout():
+    token = request.headers.get("Authorization", "")[7:]
+    db().execute("DELETE FROM sessions WHERE token = ?", (token,))
+    db().commit()
+    return json_ok({"loggedOut": True})
+
+
+@app.get("/api/admin/overview")
+@admin_required
+def admin_overview():
+    connection = db()
+    counts = {
+        "users": connection.execute("SELECT COUNT(*) FROM users WHERE upper(role) = 'USER'").fetchone()[0],
+        "bets": connection.execute("SELECT COUNT(*) FROM bets").fetchone()[0],
+        "pendingDeposits": connection.execute("SELECT COUNT(*) FROM wallet_requests WHERE request_type = 'deposit' AND status = 'pending'").fetchone()[0],
+        "pendingWithdrawals": connection.execute("SELECT COUNT(*) FROM wallet_requests WHERE request_type = 'withdrawal' AND status = 'pending'").fetchone()[0],
+        "totalStakes": float(connection.execute("SELECT COALESCE(SUM(stake), 0) FROM bets").fetchone()[0] or 0),
+        "totalBalances": float(connection.execute("SELECT COALESCE(SUM(balance), 0) FROM users WHERE upper(role) = 'USER'").fetchone()[0] or 0),
+        "totalPayouts": float(connection.execute("SELECT COALESCE(SUM(payout), 0) FROM bets").fetchone()[0] or 0),
+        "openBets": connection.execute("SELECT COUNT(*) FROM bets WHERE result = 'open'").fetchone()[0],
+        "wonBets": connection.execute("SELECT COUNT(*) FROM bets WHERE result = 'won'").fetchone()[0],
+        "lostBets": connection.execute("SELECT COUNT(*) FROM bets WHERE result = 'lost'").fetchone()[0],
+    }
+    return json_ok(counts)
+
+
+@app.get("/api/admin/users")
+@admin_required
+def admin_users():
+    search = str(request.args.get("search") or "").strip()
+    query = "SELECT id, name, email, phone, role, balance, force_password_change, created_at FROM users WHERE upper(role) = 'USER'"
+    params = []
+    if search:
+        query += " AND (lower(name) LIKE ? OR lower(email) LIKE ? OR CAST(id AS TEXT) = ?)"
+        params += [f"%{search.lower()}%", f"%{search.lower()}%", search]
+    query += " ORDER BY id DESC LIMIT 200"
+    return json_ok([admin_user_dict(row) for row in db().execute(query, params).fetchall()])
+
+
+@app.get("/api/admin/users/<int:user_id>")
+@admin_required
+def admin_user_detail(user_id):
+    user = db().execute("SELECT id, name, email, phone, role, balance, force_password_change, created_at FROM users WHERE id = ?", (user_id,)).fetchone()
+    if user is None:
+        return json_error("User not found", 404, "user_not_found")
+    connection = db()
+    bets = connection.execute("SELECT id, booking_code, total_odds, stake, status, created_at FROM bets WHERE user_id = ? ORDER BY created_at DESC LIMIT 200", (user_id,)).fetchall()
+    ledger = connection.execute("SELECT * FROM wallet_ledger WHERE user_id = ? ORDER BY created_at DESC LIMIT 200", (user_id,)).fetchall()
+    return json_ok({"user": admin_user_dict(user), "bets": [row_to_dict(row) for row in bets], "ledger": [row_to_dict(row) for row in ledger]})
+
+
+@app.patch("/api/admin/users/<int:user_id>/balance")
+@admin_required
+def admin_adjust_balance(user_id):
+    body = request.get_json(silent=True) or {}
+    try:
+        amount = float(body.get("amount"))
+    except (TypeError, ValueError):
+        return json_error("A numeric amount is required")
+    if amount == 0:
+        return json_error("Amount cannot be zero")
+    connection = db()
+    user = connection.execute("SELECT * FROM users WHERE id = ? AND upper(role) = 'USER'", (user_id,)).fetchone()
+    if user is None:
+        return json_error("User not found", 404, "user_not_found")
+    new_balance = float(user["balance"] or 0) + amount
+    if new_balance < 0:
+        return json_error("Balance cannot become negative", 400, "insufficient_balance")
+    connection.execute("UPDATE users SET balance = ? WHERE id = ?", (new_balance, user_id))
+    connection.execute("INSERT INTO wallet_ledger (user_id, amount, balance_after, entry_type, note, created_by, created_at) VALUES (?, ?, ?, 'admin_adjustment', ?, ?, ?)", (user_id, amount, new_balance, str(body.get("note") or "Admin balance adjustment"), g.admin["id"], utc_now()))
+    audit("adjust_balance", "user", user_id, {"amount": amount, "note": body.get("note")})
+    connection.commit()
+    return json_ok({"userId": user_id, "balance": new_balance})
+
+
+@app.get("/api/admin/bets")
+@admin_required
+def admin_bets():
+    rows = db().execute("SELECT b.*, u.name AS user_name, u.email AS user_email FROM bets b JOIN users u ON u.id = b.user_id ORDER BY b.created_at DESC LIMIT 300").fetchall()
+    return json_ok([row_to_dict(row) for row in rows])
+
+
+@app.post("/api/admin/bets/<int:bet_id>/settle")
+@admin_required
+def admin_settle_bet(bet_id):
+    body = request.get_json(silent=True) or {}
+    result = str(body.get("result") or "").lower()
+    if result not in {"won", "lost", "void"}:
+        return json_error("Result must be won, lost, or void")
+    connection = db()
+    bet = connection.execute("SELECT * FROM bets WHERE id = ?", (bet_id,)).fetchone()
+    if bet is None:
+        return json_error("Bet not found", 404, "bet_not_found")
+    if bet["result"] != "open":
+        return json_error("This bet has already been settled", 409, "bet_already_settled")
+    payout = float(bet["possible_win"] or 0) if result == "won" else float(bet["stake"] or 0) if result == "void" else 0
+    connection.execute("UPDATE bets SET result = ?, payout = ?, status = ? WHERE id = ?", (result, payout, f"settled-{result}", bet_id))
+    if payout:
+        user = connection.execute("SELECT balance FROM users WHERE id = ?", (bet["user_id"],)).fetchone()
+        new_balance = float(user["balance"] or 0) + payout
+        connection.execute("UPDATE users SET balance = ? WHERE id = ?", (new_balance, bet["user_id"]))
+        connection.execute("INSERT INTO wallet_ledger (user_id, amount, balance_after, entry_type, note, created_by, created_at) VALUES (?, ?, ?, 'bet_payout', ?, ?, ?)", (bet["user_id"], payout, new_balance, result, g.admin["id"], utc_now()))
+    audit("settle_bet", "bet", bet_id, {"result": result, "payout": payout})
+    connection.commit()
+    return json_ok({"betId": bet_id, "result": result, "payout": payout})
+
+
+@app.get("/api/admin/requests")
+@admin_required
+def admin_requests():
+    status = request.args.get("status")
+    query = "SELECT w.*, u.name AS user_name, u.email AS user_email FROM wallet_requests w JOIN users u ON u.id = w.user_id"
+    params = []
+    if status:
+        query += " WHERE w.status = ?"; params.append(status)
+    query += " ORDER BY w.created_at DESC LIMIT 300"
+    return json_ok([row_to_dict(row) for row in db().execute(query, params).fetchall()])
+
+
+@app.post("/api/admin/requests/<int:request_id>/<action>")
+@admin_required
+def admin_review_request(request_id, action):
+    if action not in {"approve", "reject"}:
+        return json_error("Unsupported review action", 400)
+    connection = db()
+    item = connection.execute("SELECT * FROM wallet_requests WHERE id = ?", (request_id,)).fetchone()
+    if item is None:
+        return json_error("Wallet request not found", 404, "request_not_found")
+    if item["status"] != "pending":
+        return json_error("This request has already been reviewed", 409, "request_already_reviewed")
+    new_status = "approved" if action == "approve" else "rejected"
+    reviewed_at = utc_now()
+    connection.execute("UPDATE wallet_requests SET status = ?, reviewed_by = ?, reviewed_at = ? WHERE id = ?", (new_status, g.admin["id"], reviewed_at, request_id))
+    if action == "approve":
+        signed_amount = float(item["amount"]) if item["request_type"] == "deposit" else -float(item["amount"])
+        user = connection.execute("SELECT balance FROM users WHERE id = ?", (item["user_id"],)).fetchone()
+        new_balance = float(user["balance"] or 0) + signed_amount
+        if new_balance < 0:
+            return json_error("User balance is too low for this withdrawal", 400, "insufficient_balance")
+        connection.execute("UPDATE users SET balance = ? WHERE id = ?", (new_balance, item["user_id"]))
+        connection.execute("INSERT INTO wallet_ledger (user_id, request_id, amount, balance_after, entry_type, note, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (item["user_id"], request_id, signed_amount, new_balance, item["request_type"], item["note"], g.admin["id"], reviewed_at))
+    audit(f"{action}_{item['request_type']}", "wallet_request", request_id, {"amount": item["amount"], "provider": "disabled"})
+    connection.commit()
+    return json_ok({"requestId": request_id, "status": new_status})
+
+
+@app.get("/api/admin/matches")
+@admin_required
+def admin_matches():
+    return json_ok([row_to_dict(row) for row in db().execute("SELECT * FROM matches ORDER BY start_time ASC LIMIT 300").fetchall()])
+
+
+@app.post("/api/admin/matches")
+@admin_required
+def admin_create_match():
+    body = request.get_json(silent=True) or {}
+    required = ["sport", "league", "homeTeam", "awayTeam", "startTime"]
+    if any(not str(body.get(key) or "").strip() for key in required):
+        return json_error("sport, league, homeTeam, awayTeam, and startTime are required")
+    match_id = str(body.get("id") or f"admin-{secrets.token_hex(6)}")
+    now = utc_now()
+    db().execute("INSERT INTO matches (id, sport, league, home_team, away_team, start_time, status, home_odds, draw_odds, away_odds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (match_id, body["sport"], body["league"], body["homeTeam"], body["awayTeam"], body["startTime"], body.get("status", "upcoming"), float(body.get("homeOdds") or 1.5), float(body.get("drawOdds") or 3.2), float(body.get("awayOdds") or 2.15), now, now))
+    audit("create_match", "match", match_id, body)
+    db().commit()
+    return json_ok({"id": match_id}), 201
+
+
+@app.patch("/api/admin/matches/<match_id>")
+@admin_required
+def admin_update_match(match_id):
+    match = db().execute("SELECT * FROM matches WHERE id = ?", (match_id,)).fetchone()
+    if match is None:
+        return json_error("Match not found", 404, "match_not_found")
+    body = request.get_json(silent=True) or {}
+    fields = {"status": body.get("status", match["status"]), "home_score": int(body.get("homeScore", match["home_score"])), "away_score": int(body.get("awayScore", match["away_score"])), "home_odds": float(body.get("homeOdds", match["home_odds"])), "draw_odds": float(body.get("drawOdds", match["draw_odds"])), "away_odds": float(body.get("awayOdds", match["away_odds"])), "updated_at": utc_now()}
+    db().execute("UPDATE matches SET status = ?, home_score = ?, away_score = ?, home_odds = ?, draw_odds = ?, away_odds = ?, updated_at = ? WHERE id = ?", (*fields.values(), match_id))
+    audit("update_match", "match", match_id, fields)
+    db().commit()
+    return json_ok({"updated": True})
+
+
+@app.get("/api/admin/audit-log")
+@admin_required
+def admin_audit_log():
+    rows = db().execute("SELECT a.*, u.email AS admin_email FROM admin_audit_log a JOIN users u ON u.id = a.admin_id ORDER BY a.created_at DESC LIMIT 300").fetchall()
+    return json_ok([row_to_dict(row) for row in rows])
+
+
+@app.post("/api/wallet/deposits")
+@auth_required
+def create_deposit_request():
+    body = request.get_json(silent=True) or {}
+    try:
+        amount = float(body.get("amount"))
+    except (TypeError, ValueError):
+        return json_error("A numeric amount is required")
+    if amount <= 0:
+        return json_error("Amount must be positive")
+    cursor = db().execute("INSERT INTO wallet_requests (user_id, request_type, amount, method, reference, note, created_at) VALUES (?, 'deposit', ?, ?, ?, ?, ?)", (g.user["id"], amount, body.get("method") or "manual", body.get("reference"), body.get("note"), utc_now()))
+    db().commit()
+    return json_ok({"requestId": cursor.lastrowid, "status": "pending"}), 201
+
+
+@app.post("/api/wallet/withdrawals")
+@auth_required
+def create_withdrawal_request():
+    body = request.get_json(silent=True) or {}
+    try:
+        amount = float(body.get("amount"))
+    except (TypeError, ValueError):
+        return json_error("A numeric amount is required")
+    if amount <= 0:
+        return json_error("Amount must be positive")
+    if float(g.user["balance"] or 0) < amount:
+        return json_error("Insufficient balance", 400, "insufficient_balance")
+    cursor = db().execute("INSERT INTO wallet_requests (user_id, request_type, amount, method, reference, note, created_at) VALUES (?, 'withdrawal', ?, ?, ?, ?, ?)", (g.user["id"], amount, body.get("method") or "manual", body.get("reference"), body.get("note"), utc_now()))
+    db().commit()
+    return json_ok({"requestId": cursor.lastrowid, "status": "pending"}), 201
 
 
 @app.errorhandler(404)
