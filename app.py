@@ -11,10 +11,35 @@ from flask import Flask, g, jsonify, request
 from flask_cors import CORS
 from werkzeug.security import check_password_hash, generate_password_hash
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # Local SQLite-only installs do not need the production driver.
+    psycopg = None
+    dict_row = None
+
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("BETSPORTS_DB", BASE_DIR / "betsports.db"))
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PORT = int(os.getenv("BETSPORTS_PORT", "5050"))
 HOST = os.getenv("BETSPORTS_HOST", "0.0.0.0")
+
+
+class DatabaseAdapter:
+    def __init__(self, connection, postgres=False):
+        self.connection = connection
+        self.postgres = postgres
+
+    def execute(self, query, params=()):
+        if self.postgres:
+            query = query.replace("?", "%s")
+        return self.connection.execute(query, params)
+
+    def commit(self):
+        return self.connection.commit()
+
+    def close(self):
+        return self.connection.close()
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": os.getenv("BETSPORTS_ALLOWED_ORIGINS", "*")}}, supports_credentials=True)
@@ -174,9 +199,15 @@ def utc_now():
 
 def db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys = ON")
+        if DATABASE_URL:
+            if psycopg is None:
+                raise RuntimeError("DATABASE_URL is configured but psycopg is not installed")
+            g.db = DatabaseAdapter(psycopg.connect(DATABASE_URL, row_factory=dict_row), postgres=True)
+        else:
+            connection = sqlite3.connect(DB_PATH)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            g.db = DatabaseAdapter(connection)
     return g.db
 
 
@@ -188,6 +219,21 @@ def close_db(_error=None):
 
 
 def init_db():
+    if DATABASE_URL:
+        if psycopg is None:
+            raise RuntimeError("DATABASE_URL is configured but psycopg is not installed")
+        connection = DatabaseAdapter(psycopg.connect(DATABASE_URL, row_factory=dict_row), postgres=True)
+        admin_email_raw = os.getenv("BETSPORTS_ADMIN_EMAIL", "Citydeity1@gmail.com").strip()
+        admin_email = admin_email_raw.lower()
+        admin_password = os.getenv("BETSPORTS_ADMIN_INITIAL_PASSWORD", admin_email_raw)
+        admin = connection.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone()
+        if admin is None:
+            connection.execute("INSERT INTO users (name, email, password_hash, role, force_password_change, created_at) VALUES (?, ?, ?, 'ADMIN', TRUE, ?)", ("MaxWin Administrator", admin_email, generate_password_hash(admin_password), utc_now()))
+        else:
+            connection.execute("UPDATE users SET role = 'ADMIN' WHERE email = ?", (admin_email,))
+        connection.commit()
+        connection.close()
+        return
     connection = sqlite3.connect(DB_PATH)
     connection.executescript(
         """
@@ -324,6 +370,12 @@ def row_to_dict(row):
     return dict(row) if row else None
 
 
+def scalar(row):
+    if row is None:
+        return None
+    return row[0] if not isinstance(row, dict) else next(iter(row.values()))
+
+
 def current_user():
     auth = request.headers.get("Authorization", "")
     token = auth[7:] if auth.lower().startswith("bearer ") else request.cookies.get("betsports_token")
@@ -391,7 +443,7 @@ def stored_match_to_public(row):
 @app.get("/health")
 def health():
     db().execute("SELECT 1").fetchone()
-    return json_ok({"service": "betsports-backend", "status": "healthy", "time": utc_now(), "database": "sqlite"})
+    return json_ok({"service": "betsports-backend", "status": "healthy", "time": utc_now(), "database": "neon-postgres" if DATABASE_URL else "sqlite"})
 
 
 @app.get("/")
@@ -404,7 +456,7 @@ def backend_home():
 
 @app.get("/api/public/config")
 def public_config():
-    return json_ok({"brand": "BETSPORTS", "currency": "GHS", "minStake": 200, "sports": SPORTS, "demoMode": True})
+    return json_ok({"brand": "BETSPORTS", "currency": "GHS", "minStake": 200, "sports": SPORTS, "demoMode": not bool(DATABASE_URL), "paymentProvider": "disabled"})
 
 
 @app.post("/api/auth/register")
@@ -418,13 +470,14 @@ def register():
     try:
         connection = db()
         cursor = connection.execute(
-            "INSERT INTO users (name, email, phone, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO users (name, email, phone, password_hash, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
             (name, email, body.get("phone"), generate_password_hash(password), utc_now()),
         )
+        new_user_id = cursor.fetchone()["id"]
         connection.commit()
     except sqlite3.IntegrityError:
         return json_error("An account with that email already exists", 409, "email_exists")
-    user = connection.execute("SELECT * FROM users WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    user = connection.execute("SELECT * FROM users WHERE id = ?", (new_user_id,)).fetchone()
     return _session_response(user), 201
 
 
@@ -571,7 +624,7 @@ def favourites():
     if not item_id:
         return json_error("itemId is required")
     if request.method == "POST":
-        connection.execute("INSERT OR IGNORE INTO favourites (user_id, item_type, item_id, created_at) VALUES (?, ?, ?, ?)", (g.user["id"], item_type, item_id, utc_now()))
+        connection.execute("INSERT INTO favourites (user_id, item_type, item_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT (user_id, item_type, item_id) DO NOTHING", (g.user["id"], item_type, item_id, utc_now()))
     else:
         connection.execute("DELETE FROM favourites WHERE user_id = ? AND item_type = ? AND item_id = ?", (g.user["id"], item_type, item_id))
     connection.commit()
@@ -598,7 +651,7 @@ def bet_slip():
         odds = float(body.get("odds") or 1)
         if not match_id or not selection:
             return json_error("matchId and selection are required")
-        connection.execute("INSERT OR REPLACE INTO bet_slips (user_id, match_id, selection, odds, stake, created_at) VALUES (?, ?, ?, ?, ?, ?)", (g.user["id"], match_id, selection, odds, float(body.get("stake") or 0), utc_now()))
+            connection.execute("INSERT INTO bet_slips (user_id, match_id, selection, odds, stake, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (user_id, match_id, selection) DO UPDATE SET odds = EXCLUDED.odds, stake = EXCLUDED.stake, created_at = EXCLUDED.created_at", (g.user["id"], match_id, selection, odds, float(body.get("stake") or 0), utc_now()))
     connection.commit()
     return json_ok({"updated": True})
 
@@ -725,16 +778,16 @@ def admin_logout():
 def admin_overview():
     connection = db()
     counts = {
-        "users": connection.execute("SELECT COUNT(*) FROM users WHERE upper(role) = 'USER'").fetchone()[0],
-        "bets": connection.execute("SELECT COUNT(*) FROM bets").fetchone()[0],
-        "pendingDeposits": connection.execute("SELECT COUNT(*) FROM wallet_requests WHERE request_type = 'deposit' AND status = 'pending'").fetchone()[0],
-        "pendingWithdrawals": connection.execute("SELECT COUNT(*) FROM wallet_requests WHERE request_type = 'withdrawal' AND status = 'pending'").fetchone()[0],
-        "totalStakes": float(connection.execute("SELECT COALESCE(SUM(stake), 0) FROM bets").fetchone()[0] or 0),
-        "totalBalances": float(connection.execute("SELECT COALESCE(SUM(balance), 0) FROM users WHERE upper(role) = 'USER'").fetchone()[0] or 0),
-        "totalPayouts": float(connection.execute("SELECT COALESCE(SUM(payout), 0) FROM bets").fetchone()[0] or 0),
-        "openBets": connection.execute("SELECT COUNT(*) FROM bets WHERE result = 'open'").fetchone()[0],
-        "wonBets": connection.execute("SELECT COUNT(*) FROM bets WHERE result = 'won'").fetchone()[0],
-        "lostBets": connection.execute("SELECT COUNT(*) FROM bets WHERE result = 'lost'").fetchone()[0],
+        "users": scalar(connection.execute("SELECT COUNT(*) FROM users WHERE upper(role) = 'USER'").fetchone()),
+        "bets": scalar(connection.execute("SELECT COUNT(*) FROM bets").fetchone()),
+        "pendingDeposits": scalar(connection.execute("SELECT COUNT(*) FROM wallet_requests WHERE request_type = 'deposit' AND status = 'pending'").fetchone()),
+        "pendingWithdrawals": scalar(connection.execute("SELECT COUNT(*) FROM wallet_requests WHERE request_type = 'withdrawal' AND status = 'pending'").fetchone()),
+        "totalStakes": float(scalar(connection.execute("SELECT COALESCE(SUM(stake), 0) FROM bets").fetchone()) or 0),
+        "totalBalances": float(scalar(connection.execute("SELECT COALESCE(SUM(balance), 0) FROM users WHERE upper(role) = 'USER'").fetchone()) or 0),
+        "totalPayouts": float(scalar(connection.execute("SELECT COALESCE(SUM(payout), 0) FROM bets").fetchone()) or 0),
+        "openBets": scalar(connection.execute("SELECT COUNT(*) FROM bets WHERE result = 'open'").fetchone()),
+        "wonBets": scalar(connection.execute("SELECT COUNT(*) FROM bets WHERE result = 'won'").fetchone()),
+        "lostBets": scalar(connection.execute("SELECT COUNT(*) FROM bets WHERE result = 'lost'").fetchone()),
     }
     return json_ok(counts)
 
@@ -911,9 +964,10 @@ def create_deposit_request():
         return json_error("A numeric amount is required")
     if amount <= 0:
         return json_error("Amount must be positive")
-    cursor = db().execute("INSERT INTO wallet_requests (user_id, request_type, amount, method, reference, note, created_at) VALUES (?, 'deposit', ?, ?, ?, ?, ?)", (g.user["id"], amount, body.get("method") or "manual", body.get("reference"), body.get("note"), utc_now()))
+    cursor = db().execute("INSERT INTO wallet_requests (user_id, request_type, amount, method, reference, note, created_at) VALUES (?, 'deposit', ?, ?, ?, ?, ?) RETURNING id", (g.user["id"], amount, body.get("method") or "manual", body.get("reference"), body.get("note"), utc_now()))
+    request_id = cursor.fetchone()["id"]
     db().commit()
-    return json_ok({"requestId": cursor.lastrowid, "status": "pending"}), 201
+    return json_ok({"requestId": request_id, "status": "pending"}), 201
 
 
 @app.post("/api/wallet/withdrawals")
@@ -928,9 +982,10 @@ def create_withdrawal_request():
         return json_error("Amount must be positive")
     if float(g.user["balance"] or 0) < amount:
         return json_error("Insufficient balance", 400, "insufficient_balance")
-    cursor = db().execute("INSERT INTO wallet_requests (user_id, request_type, amount, method, reference, note, created_at) VALUES (?, 'withdrawal', ?, ?, ?, ?, ?)", (g.user["id"], amount, body.get("method") or "manual", body.get("reference"), body.get("note"), utc_now()))
+    cursor = db().execute("INSERT INTO wallet_requests (user_id, request_type, amount, method, reference, note, created_at) VALUES (?, 'withdrawal', ?, ?, ?, ?, ?) RETURNING id", (g.user["id"], amount, body.get("method") or "manual", body.get("reference"), body.get("note"), utc_now()))
+    request_id = cursor.fetchone()["id"]
     db().commit()
-    return json_ok({"requestId": cursor.lastrowid, "status": "pending"}), 201
+    return json_ok({"requestId": request_id, "status": "pending"}), 201
 
 
 @app.errorhandler(404)
