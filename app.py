@@ -229,9 +229,9 @@ def init_db():
         admin_password = os.getenv("BETSPORTS_ADMIN_INITIAL_PASSWORD", admin_email_raw)
         admin = connection.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone()
         if admin is None:
-            connection.execute("INSERT INTO users (name, email, password_hash, role, force_password_change, created_at) VALUES (?, ?, ?, 'ADMIN', TRUE, ?)", ("MaxWin Administrator", admin_email, generate_password_hash(admin_password), utc_now()))
+            connection.execute("INSERT INTO users (name, email, password_hash, role, force_password_change, created_at) VALUES (?, ?, ?, 'SUPER_ADMIN', TRUE, ?)", ("MaxWin Administrator", admin_email, generate_password_hash(admin_password), utc_now()))
         else:
-            connection.execute("UPDATE users SET role = 'ADMIN' WHERE email = ?", (admin_email,))
+            connection.execute("UPDATE users SET role = 'SUPER_ADMIN' WHERE email = ?", (admin_email,))
         connection.commit()
         connection.close()
         return
@@ -350,9 +350,9 @@ def init_db():
     admin_password = os.getenv("BETSPORTS_ADMIN_INITIAL_PASSWORD", admin_email_raw)
     admin = connection.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone()
     if admin is None:
-        connection.execute("INSERT INTO users (name, email, password_hash, role, force_password_change, created_at) VALUES (?, ?, ?, 'ADMIN', 1, ?)", ("MaxWin Administrator", admin_email, generate_password_hash(admin_password), utc_now()))
+        connection.execute("INSERT INTO users (name, email, password_hash, role, force_password_change, created_at) VALUES (?, ?, ?, 'SUPER_ADMIN', 1, ?)", ("MaxWin Administrator", admin_email, generate_password_hash(admin_password), utc_now()))
     else:
-        connection.execute("UPDATE users SET role = 'ADMIN' WHERE email = ?", (admin_email,))
+        connection.execute("UPDATE users SET role = 'SUPER_ADMIN' WHERE email = ?", (admin_email,))
     connection.commit()
     connection.close()
 
@@ -743,6 +743,16 @@ def admin_required(handler):
     return wrapped
 
 
+def super_admin_required(handler):
+    @wraps(handler)
+    @admin_required
+    def wrapped(*args, **kwargs):
+        if (g.admin["role"] or "").upper() != "SUPER_ADMIN":
+            return json_error("Super administrator authentication required", 403, "super_admin_required")
+        return handler(*args, **kwargs)
+    return wrapped
+
+
 def audit(action, entity_type, entity_id=None, details=None):
     db().execute("INSERT INTO admin_audit_log (admin_id, action, entity_type, entity_id, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", (g.admin["id"], action, entity_type, str(entity_id) if entity_id is not None else None, json.dumps(details or {}), utc_now()))
 
@@ -786,6 +796,39 @@ def admin_change_password():
 @admin_required
 def admin_me():
     return json_ok({"admin": admin_user_dict(g.admin), "mustChangePassword": bool(g.admin["force_password_change"])})
+
+
+@app.get("/api/admin/admins")
+@super_admin_required
+def admin_list_admins():
+    rows = db().execute("SELECT id, name, email, phone, role, force_password_change, created_at FROM users WHERE upper(role) IN ('ADMIN', 'SUPER_ADMIN') ORDER BY id ASC").fetchall()
+    return json_ok([admin_user_dict(row) for row in rows])
+
+
+@app.post("/api/admin/admins")
+@super_admin_required
+def admin_create_admin():
+    body = request.get_json(silent=True) or {}
+    email = str(body.get("email") or "").strip().lower()
+    name = str(body.get("name") or "").strip()
+    password = str(body.get("password") or "")
+    if not email or "@" not in email:
+        return json_error("A valid administrator email is required", 400, "invalid_email")
+    if not name:
+        return json_error("Administrator name is required", 400, "invalid_name")
+    if len(password) < 10:
+        return json_error("The temporary password must be at least 10 characters", 400, "weak_password")
+    connection = db()
+    existing = connection.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+    if existing:
+        return json_error("An account with this email already exists", 409, "email_in_use")
+    cursor = connection.execute("INSERT INTO users (name, email, password_hash, role, force_password_change, created_at) VALUES (?, ?, ?, 'ADMIN', ?, ?) RETURNING id", (name, email, generate_password_hash(password), 1, utc_now()))
+    row = cursor.fetchone()
+    admin_id = scalar(row)
+    audit("create_admin", "admin", admin_id, {"email": email, "role": "ADMIN"})
+    connection.commit()
+    created = connection.execute("SELECT id, name, email, phone, role, force_password_change, created_at FROM users WHERE id = ?", (admin_id,)).fetchone()
+    return json_ok(admin_user_dict(created)), 201
 
 
 @app.post("/api/admin/auth/logout")
