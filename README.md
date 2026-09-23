@@ -43,3 +43,5 @@ The API listens on `0.0.0.0:5050` by default. Set `BETSPORTS_PORT` or `BETSPORTS
 - `/api/admin/*` for protected administrator operations
 
 This is a demo-safe backend: betting endpoints persist selections and return simulated outcomes; they do not process payments or real money.
+
+Wallet deposits, withdrawals, and administrator approval of wallet requests are disabled by default. They return HTTP 503 with the `payment_gateway_disabled` code until a verified provider is configured and `BETSPORTS_PAYMENTS_ENABLED=true` is explicitly set in the production environment.

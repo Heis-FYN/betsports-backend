@@ -28,6 +28,15 @@ PORT = int(os.getenv("BETSPORTS_PORT", "5050"))
 HOST = os.getenv("BETSPORTS_HOST", "0.0.0.0")
 ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("BETSPORTS_ALLOWED_ORIGINS", "https://betsports-frontend-netlify.netlify.app,http://localhost:5173").split(",") if origin.strip()]
 REQUIRE_POSTGRES = os.getenv("BETSPORTS_REQUIRE_POSTGRES", "false").strip().lower() in {"1", "true", "yes", "on"}
+PAYMENTS_ENABLED = os.getenv("BETSPORTS_PAYMENTS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def payment_gateway_disabled():
+    return json_error(
+        "Deposits and withdrawals are temporarily unavailable because no payment gateway is active.",
+        503,
+        "payment_gateway_disabled",
+    )
 
 
 class DatabaseAdapter:
@@ -1071,6 +1080,8 @@ def admin_requests():
 def admin_review_request(request_id, action):
     if action not in {"approve", "reject"}:
         return json_error("Unsupported review action", 400)
+    if action == "approve" and not PAYMENTS_ENABLED:
+        return payment_gateway_disabled()
     connection = db()
     item = connection.execute("SELECT * FROM wallet_requests WHERE id = ?", (request_id,)).fetchone()
     if item is None:
@@ -1150,6 +1161,8 @@ def admin_audit_log():
 @app.post("/api/wallet/deposits")
 @auth_required
 def create_deposit_request():
+    if not PAYMENTS_ENABLED:
+        return payment_gateway_disabled()
     body = request.get_json(silent=True) or {}
     try:
         amount = float(body.get("amount"))
@@ -1166,6 +1179,8 @@ def create_deposit_request():
 @app.post("/api/wallet/withdrawals")
 @auth_required
 def create_withdrawal_request():
+    if not PAYMENTS_ENABLED:
+        return payment_gateway_disabled()
     body = request.get_json(silent=True) or {}
     try:
         amount = float(body.get("amount"))
