@@ -863,7 +863,12 @@ def super_admin_required(handler):
 
 
 def audit(action, entity_type, entity_id=None, details=None):
-    db().execute("INSERT INTO admin_audit_log (admin_id, action, entity_type, entity_id, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", (g.admin["id"], action, entity_type, str(entity_id) if entity_id is not None else None, json.dumps(details or {}), utc_now()))
+    connection = db()
+    params = (g.admin["id"], action, entity_type, str(entity_id) if entity_id is not None else None, json.dumps(details or {}), utc_now())
+    if connection.postgres:
+        connection.execute("INSERT INTO admin_audit_log (admin_id, action, entity_type, entity_id, details_json, created_at) VALUES (?, ?, ?, ?, ?::jsonb, ?)", params)
+    else:
+        connection.execute("INSERT INTO admin_audit_log (admin_id, action, entity_type, entity_id, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", params)
 
 
 def admin_user_dict(row):
