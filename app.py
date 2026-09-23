@@ -26,7 +26,14 @@ DB_PATH = Path(os.getenv("BETSPORTS_DB", BASE_DIR / "betsports.db"))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PORT = int(os.getenv("BETSPORTS_PORT", "5050"))
 HOST = os.getenv("BETSPORTS_HOST", "0.0.0.0")
-ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("BETSPORTS_ALLOWED_ORIGINS", "https://betsports-frontend-netlify.netlify.app,http://localhost:5173").split(",") if origin.strip()]
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "BETSPORTS_ALLOWED_ORIGINS",
+        "https://betsports-frontend-netlify.netlify.app,https://main--betsports-frontend-netlify.netlify.app,http://localhost:5173,http://localhost:4173",
+    ).split(",")
+    if origin.strip()
+]
 REQUIRE_POSTGRES = os.getenv("BETSPORTS_REQUIRE_POSTGRES", "false").strip().lower() in {"1", "true", "yes", "on"}
 PAYMENTS_ENABLED = os.getenv("BETSPORTS_PAYMENTS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
