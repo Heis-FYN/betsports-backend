@@ -864,7 +864,7 @@ def super_admin_required(handler):
 
 def audit(action, entity_type, entity_id=None, details=None):
     connection = db()
-    params = (g.admin["id"], action, entity_type, str(entity_id) if entity_id is not None else None, json.dumps(details or {}), utc_now())
+    params = (g.admin["id"], action, entity_type, str(entity_id) if entity_id is not None else None, json.dumps(details or {}, default=str), utc_now())
     if connection.postgres:
         connection.execute("INSERT INTO admin_audit_log (admin_id, action, entity_type, entity_id, details_json, created_at) VALUES (?, ?, ?, ?, ?::jsonb, ?)", params)
     else:
