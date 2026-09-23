@@ -27,6 +27,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PORT = int(os.getenv("BETSPORTS_PORT", "5050"))
 HOST = os.getenv("BETSPORTS_HOST", "0.0.0.0")
 ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("BETSPORTS_ALLOWED_ORIGINS", "https://betsports-frontend-netlify.netlify.app,http://localhost:5173").split(",") if origin.strip()]
+REQUIRE_POSTGRES = os.getenv("BETSPORTS_REQUIRE_POSTGRES", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class DatabaseAdapter:
@@ -244,13 +245,17 @@ def close_db(_error=None):
 
 
 def init_db():
+    if REQUIRE_POSTGRES and not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is required when BETSPORTS_REQUIRE_POSTGRES is enabled")
+    admin_email_raw = os.getenv("BETSPORTS_ADMIN_EMAIL", "").strip()
+    admin_password = os.getenv("BETSPORTS_ADMIN_INITIAL_PASSWORD", "")
+    if not admin_email_raw or not admin_password:
+        raise RuntimeError("BETSPORTS_ADMIN_EMAIL and BETSPORTS_ADMIN_INITIAL_PASSWORD must be configured")
+    admin_email = admin_email_raw.lower()
     if DATABASE_URL:
         if psycopg is None:
             raise RuntimeError("DATABASE_URL is configured but psycopg is not installed")
         connection = DatabaseAdapter(psycopg.connect(DATABASE_URL, row_factory=dict_row), postgres=True)
-        admin_email_raw = os.getenv("BETSPORTS_ADMIN_EMAIL", "Citydeity1@gmail.com").strip()
-        admin_email = admin_email_raw.lower()
-        admin_password = os.getenv("BETSPORTS_ADMIN_INITIAL_PASSWORD", admin_email_raw)
         admin = connection.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone()
         if admin is None:
             connection.execute("INSERT INTO users (name, email, password_hash, role, force_password_change, created_at) VALUES (?, ?, ?, 'SUPER_ADMIN', TRUE, ?)", ("MaxWin Administrator", admin_email, generate_password_hash(admin_password), utc_now()))
@@ -369,9 +374,6 @@ def init_db():
     for column, definition in (("possible_win", "REAL NOT NULL DEFAULT 0"), ("payout", "REAL NOT NULL DEFAULT 0"), ("result", "TEXT NOT NULL DEFAULT 'open'")):
         if column not in bet_columns:
             connection.execute(f"ALTER TABLE bets ADD COLUMN {column} {definition}")
-    admin_email_raw = os.getenv("BETSPORTS_ADMIN_EMAIL", "Citydeity1@gmail.com").strip()
-    admin_email = admin_email_raw.lower()
-    admin_password = os.getenv("BETSPORTS_ADMIN_INITIAL_PASSWORD", admin_email_raw)
     admin = connection.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone()
     if admin is None:
         connection.execute("INSERT INTO users (name, email, password_hash, role, force_password_change, created_at) VALUES (?, ?, ?, 'SUPER_ADMIN', 1, ?)", ("MaxWin Administrator", admin_email, generate_password_hash(admin_password), utc_now()))
