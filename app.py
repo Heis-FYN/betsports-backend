@@ -376,7 +376,7 @@ def init_db():
             connection.execute(f"ALTER TABLE bets ADD COLUMN {column} {definition}")
     admin = connection.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone()
     if admin is None:
-        connection.execute("INSERT INTO users (name, email, password_hash, role, force_password_change, created_at) VALUES (?, ?, ?, 'SUPER_ADMIN', 1, ?)", ("MaxWin Administrator", admin_email, generate_password_hash(admin_password), utc_now()))
+        connection.execute("INSERT INTO users (name, email, password_hash, role, force_password_change, created_at) VALUES (?, ?, ?, 'SUPER_ADMIN', ?, ?)", ("MaxWin Administrator", admin_email, generate_password_hash(admin_password), True, utc_now()))
     else:
         connection.execute("UPDATE users SET role = 'SUPER_ADMIN' WHERE email = ?", (admin_email,))
     connection.commit()
@@ -650,7 +650,7 @@ def change_password():
     if check_password_hash(g.user["password_hash"], new_password):
         return json_error("New password must be different from the current password", 400, "same_password")
     connection = db()
-    connection.execute("UPDATE users SET password_hash = ?, force_password_change = 0 WHERE id = ?", (generate_password_hash(new_password), g.user["id"]))
+    connection.execute("UPDATE users SET password_hash = ?, force_password_change = FALSE WHERE id = ?", (generate_password_hash(new_password), g.user["id"]))
     current_token = request_token()
     connection.execute("DELETE FROM sessions WHERE user_id = ? AND token != ?", (g.user["id"], current_token))
     connection.commit()
@@ -895,7 +895,7 @@ def admin_change_password():
     password = str(body.get("password") or "")
     if len(password) < 10:
         return json_error("Password must be at least 10 characters", 400, "weak_password")
-    db().execute("UPDATE users SET password_hash = ?, force_password_change = 0 WHERE id = ?", (generate_password_hash(password), g.admin["id"]))
+    db().execute("UPDATE users SET password_hash = ?, force_password_change = FALSE WHERE id = ?", (generate_password_hash(password), g.admin["id"]))
     audit("change_password", "admin", g.admin["id"])
     db().commit()
     return json_ok({"changed": True})
@@ -931,7 +931,7 @@ def admin_create_admin():
     existing = connection.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
     if existing:
         return json_error("An account with this email already exists", 409, "email_in_use")
-    cursor = connection.execute("INSERT INTO users (name, email, password_hash, role, force_password_change, created_at) VALUES (?, ?, ?, 'ADMIN', ?, ?) RETURNING id", (name, email, generate_password_hash(password), 1, utc_now()))
+    cursor = connection.execute("INSERT INTO users (name, email, password_hash, role, force_password_change, created_at) VALUES (?, ?, ?, 'ADMIN', ?, ?) RETURNING id", (name, email, generate_password_hash(password), True, utc_now()))
     row = cursor.fetchone()
     admin_id = scalar(row)
     audit("create_admin", "admin", admin_id, {"email": email, "role": "ADMIN"})
