@@ -272,6 +272,8 @@ def init_db():
         if psycopg is None:
             raise RuntimeError("DATABASE_URL is configured but psycopg is not installed")
         connection = DatabaseAdapter(psycopg.connect(DATABASE_URL, row_factory=dict_row), postgres=True)
+        connection.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS odds_source TEXT NOT NULL DEFAULT 'manual'")
+        connection.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS odds_available BOOLEAN NOT NULL DEFAULT FALSE")
         admin = connection.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone()
         if admin is None:
             connection.execute("INSERT INTO users (name, email, password_hash, role, force_password_change, created_at) VALUES (?, ?, ?, 'SUPER_ADMIN', TRUE, ?)", ("MaxWin Administrator", admin_email, generate_password_hash(admin_password), utc_now()))
@@ -341,6 +343,8 @@ def init_db():
             home_odds REAL NOT NULL DEFAULT 1.5,
             draw_odds REAL NOT NULL DEFAULT 3.2,
             away_odds REAL NOT NULL DEFAULT 2.15,
+            odds_source TEXT NOT NULL DEFAULT 'manual',
+            odds_available INTEGER NOT NULL DEFAULT 0,
             home_score INTEGER NOT NULL DEFAULT 0,
             away_score INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
@@ -386,6 +390,10 @@ def init_db():
     for column, definition in (("role", "TEXT NOT NULL DEFAULT 'USER'"), ("balance", "REAL NOT NULL DEFAULT 0"), ("force_password_change", "INTEGER NOT NULL DEFAULT 0")):
         if column not in existing_columns:
             connection.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+    match_columns = {row[1] for row in connection.execute("PRAGMA table_info(matches)").fetchall()}
+    for column, definition in (("odds_source", "TEXT NOT NULL DEFAULT 'manual'"), ("odds_available", "INTEGER NOT NULL DEFAULT 0")):
+        if column not in match_columns:
+            connection.execute(f"ALTER TABLE matches ADD COLUMN {column} {definition}")
     bet_columns = {row[1] for row in connection.execute("PRAGMA table_info(bets)").fetchall()}
     for column, definition in (("possible_win", "REAL NOT NULL DEFAULT 0"), ("payout", "REAL NOT NULL DEFAULT 0"), ("result", "TEXT NOT NULL DEFAULT 'open'")):
         if column not in bet_columns:
@@ -479,9 +487,25 @@ def _espn_status(event):
     return "upcoming"
 
 
-def _espn_number(value, fallback):
-    try: return float(value)
-    except (TypeError, ValueError): return fallback
+def _american_to_decimal(value):
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if price == 0:
+        return None
+    return round(1 + (price / 100 if price > 0 else 100 / abs(price)), 4)
+
+
+def _espn_moneyline(odds, side):
+    moneyline = odds.get("moneyline") or {}
+    market = moneyline.get(side) or {}
+    close = market.get("close") or market.get("open") or {}
+    value = close.get("odds") or market.get("odds")
+    if value is None:
+        team_odds = odds.get(f"{side}TeamOdds") or {}
+        value = team_odds.get("moneyLine")
+    return _american_to_decimal(value)
 
 
 def _espn_event_to_match(event, sport, league):
@@ -498,19 +522,24 @@ def _espn_event_to_match(event, sport, league):
     state = _espn_status(event)
     home_score = int(float(home.get("score") or 0)) if str(home.get("score") or "0").replace('.', '', 1).isdigit() else 0
     away_score = int(float(away.get("score") or 0)) if str(away.get("score") or "0").replace('.', '', 1).isdigit() else 0
-    odds = {"home": 1.5, "draw": 3.2, "away": 2.15}
-    event_odds = competition.get("odds") or []
+    odds = {"home": None, "draw": None, "away": None}
+    event_odds = [item for item in (competition.get("odds") or []) if item]
     if event_odds:
-        first = event_odds[0] or {}
-        odds["home"] = _espn_number(first.get("homeTeamOdds", {}).get("moneyLine") or first.get("homeMoneyLine"), odds["home"])
-        odds["away"] = _espn_number(first.get("awayTeamOdds", {}).get("moneyLine") or first.get("awayMoneyLine"), odds["away"])
+        first = event_odds[0]
+        odds["home"] = _espn_moneyline(first, "home")
+        odds["away"] = _espn_moneyline(first, "away")
+        draw_moneyline = (first.get("drawOdds") or {}).get("moneyLine") if isinstance(first.get("drawOdds"), dict) else first.get("drawMoneyLine")
+        odds["draw"] = _american_to_decimal(draw_moneyline)
     opaque_id = "m-" + hashlib.sha256(f"{sport}:{league}:{event_id}".encode()).hexdigest()[:20]
     return {
         "id": opaque_id, "sport": sport, "league": (event.get("league") or {}).get("name") or league,
         "homeTeam": {"id": str(home_team.get("id") or f"{event_id}-home"), "name": home_team.get("displayName"), "shortName": home_team.get("shortDisplayName") or home_team.get("abbreviation") or home_team.get("displayName", "Home")[:3].upper()},
         "awayTeam": {"id": str(away_team.get("id") or f"{event_id}-away"), "name": away_team.get("displayName"), "shortName": away_team.get("shortDisplayName") or away_team.get("abbreviation") or away_team.get("displayName", "Away")[:3].upper()},
         "startTime": event.get("date") or utc_now(), "status": state,
-        "score": {"home": home_score, "away": away_score}, "odds": odds, "isLive": state == "live", "featured": False,
+        "score": {"home": home_score, "away": away_score}, "odds": odds,
+        "oddsSource": "ESPN" if any(value is not None for value in odds.values()) else None,
+        "oddsAvailable": odds["home"] is not None and odds["away"] is not None,
+        "isLive": state == "live", "featured": False,
     }
 
 
@@ -528,11 +557,12 @@ def _fetch_espn_league(sport, league):
 def _upsert_ingested_match(match):
     connection = db()
     existing = connection.execute("SELECT id FROM matches WHERE id = ?", (match["id"],)).fetchone()
-    values = (match["sport"], match["league"], match["homeTeam"]["name"], match["awayTeam"]["name"], match["startTime"], match["status"], match["odds"]["home"], match["odds"]["draw"], match["odds"]["away"], match["score"]["home"], match["score"]["away"], utc_now())
+    odds = match["odds"]
+    values = (match["sport"], match["league"], match["homeTeam"]["name"], match["awayTeam"]["name"], match["startTime"], match["status"], odds.get("home") or 0, odds.get("draw") or 0, odds.get("away") or 0, match.get("oddsSource") or "ESPN", int(bool(match.get("oddsAvailable"))), match["score"]["home"], match["score"]["away"], utc_now())
     if existing:
-        connection.execute("UPDATE matches SET sport = ?, league = ?, home_team = ?, away_team = ?, start_time = ?, status = ?, home_odds = ?, draw_odds = ?, away_odds = ?, home_score = ?, away_score = ?, updated_at = ? WHERE id = ?", (*values, match["id"]))
+        connection.execute("UPDATE matches SET sport = ?, league = ?, home_team = ?, away_team = ?, start_time = ?, status = ?, home_odds = ?, draw_odds = ?, away_odds = ?, odds_source = ?, odds_available = ?, home_score = ?, away_score = ?, updated_at = ? WHERE id = ?", (*values, match["id"]))
     else:
-        connection.execute("INSERT INTO matches (id, sport, league, home_team, away_team, start_time, status, home_odds, draw_odds, away_odds, home_score, away_score, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (match["id"], *values[:-1], utc_now(), values[-1]))
+        connection.execute("INSERT INTO matches (id, sport, league, home_team, away_team, start_time, status, home_odds, draw_odds, away_odds, odds_source, odds_available, home_score, away_score, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (match["id"], *values[:-1], utc_now(), values[-1]))
 
 
 def sync_espn_sport(sport, force=False):
@@ -554,10 +584,10 @@ def matches_for(sport, status="upcoming"):
     normalized = "live" if status in ("live", "in-play") else "upcoming"
     if sport in ESPN_LEAGUE_CATALOG:
         sync_espn_sport(sport)
-    stored = db().execute("SELECT * FROM matches WHERE sport = ? AND status = ? ORDER BY start_time ASC LIMIT 300", (sport, normalized)).fetchall()
+    stored = db().execute("SELECT * FROM matches WHERE sport = ? AND status = ? AND odds_available = 1 ORDER BY start_time ASC LIMIT 300", (sport, normalized)).fetchall()
     if stored:
         return [stored_match_to_public(row) for row in stored]
-    return [make_match(sport, i, normalized) for i in range(3)]
+    return []
 
 
 def stored_match_to_public(row):
@@ -567,7 +597,9 @@ def stored_match_to_public(row):
         "awayTeam": {"id": f"{row['id']}-away", "name": row["away_team"], "shortName": row["away_team"][:3].upper()},
         "startTime": row["start_time"], "status": row["status"],
         "score": {"home": row["home_score"], "away": row["away_score"]},
-        "odds": {"home": row["home_odds"], "draw": row["draw_odds"], "away": row["away_odds"]},
+        "odds": {"home": row["home_odds"] or None, "draw": row["draw_odds"] or None, "away": row["away_odds"] or None},
+        "oddsSource": row["odds_source"] if row["odds_available"] else None,
+        "oddsAvailable": bool(row["odds_available"]),
         "isLive": row["status"] == "live", "featured": False,
     }
 
