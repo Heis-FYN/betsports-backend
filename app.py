@@ -494,7 +494,15 @@ def _american_to_decimal(value):
         return None
     if price == 0:
         return None
-    return round(1 + (price / 100 if price > 0 else 100 / abs(price)), 4)
+    return round(1 + (price / 100 if price > 0 else 100 / abs(price)), 2)
+
+
+def _display_odds(value):
+    try:
+        number = float(value)
+        return None if number <= 0 else f"{number:.2f}"
+    except (TypeError, ValueError):
+        return None
 
 
 def _espn_moneyline(odds, side):
@@ -597,7 +605,7 @@ def stored_match_to_public(row):
         "awayTeam": {"id": f"{row['id']}-away", "name": row["away_team"], "shortName": row["away_team"][:3].upper()},
         "startTime": row["start_time"], "status": row["status"],
         "score": {"home": row["home_score"], "away": row["away_score"]},
-        "odds": {"home": row["home_odds"] or None, "draw": row["draw_odds"] or None, "away": row["away_odds"] or None},
+        "odds": {"home": _display_odds(row["home_odds"]), "draw": _display_odds(row["draw_odds"]), "away": _display_odds(row["away_odds"])},
         "oddsSource": row["odds_source"] if row["odds_available"] else None,
         "oddsAvailable": bool(row["odds_available"]),
         "isLive": row["status"] == "live", "featured": False,
