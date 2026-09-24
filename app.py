@@ -913,9 +913,14 @@ def admin_login():
 @admin_required
 def admin_change_password():
     body = request.get_json(silent=True) or {}
+    current_password = str(body.get("currentPassword") or body.get("current_password") or "")
     password = str(body.get("password") or "")
+    if not bool(g.admin["force_password_change"]) and not check_password_hash(g.admin["password_hash"], current_password):
+        return json_error("Current password is incorrect", 401, "invalid_current_password")
     if len(password) < 10:
         return json_error("Password must be at least 10 characters", 400, "weak_password")
+    if check_password_hash(g.admin["password_hash"], password):
+        return json_error("New password must be different from the current password", 400, "same_password")
     db().execute("UPDATE users SET password_hash = ?, force_password_change = FALSE WHERE id = ?", (generate_password_hash(password), g.admin["id"]))
     audit("change_password", "admin", g.admin["id"])
     db().commit()
