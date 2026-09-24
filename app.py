@@ -508,10 +508,16 @@ def _display_odds(value):
 def _espn_moneyline(odds, side):
     moneyline = odds.get("moneyline") or {}
     market = moneyline.get(side) or {}
-    if side == "draw":
-        market = odds.get("drawOdds") or market
     close = market.get("close") or market.get("open") or {}
     value = close.get("odds") or market.get("odds")
+    if side == "draw" and value is None:
+        for candidate in (odds.get("drawOdds"), odds.get("drawMoneyline"), odds.get("drawMoneyLine")):
+            if not isinstance(candidate, dict):
+                continue
+            candidate_close = candidate.get("close") or candidate.get("open") or {}
+            value = candidate_close.get("odds") or candidate.get("odds") or candidate.get("moneyLine") or candidate.get("moneyline")
+            if value is not None:
+                break
     if value is None:
         team_odds = odds.get(f"{side}TeamOdds") or {}
         value = team_odds.get("moneyLine")
