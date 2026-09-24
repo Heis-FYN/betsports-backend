@@ -558,7 +558,7 @@ def _upsert_ingested_match(match):
     connection = db()
     existing = connection.execute("SELECT id FROM matches WHERE id = ?", (match["id"],)).fetchone()
     odds = match["odds"]
-    values = (match["sport"], match["league"], match["homeTeam"]["name"], match["awayTeam"]["name"], match["startTime"], match["status"], odds.get("home") or 0, odds.get("draw") or 0, odds.get("away") or 0, match.get("oddsSource") or "ESPN", int(bool(match.get("oddsAvailable"))), match["score"]["home"], match["score"]["away"], utc_now())
+    values = (match["sport"], match["league"], match["homeTeam"]["name"], match["awayTeam"]["name"], match["startTime"], match["status"], odds.get("home") or 0, odds.get("draw") or 0, odds.get("away") or 0, match.get("oddsSource") or "ESPN", bool(match.get("oddsAvailable")), match["score"]["home"], match["score"]["away"], utc_now())
     if existing:
         connection.execute("UPDATE matches SET sport = ?, league = ?, home_team = ?, away_team = ?, start_time = ?, status = ?, home_odds = ?, draw_odds = ?, away_odds = ?, odds_source = ?, odds_available = ?, home_score = ?, away_score = ?, updated_at = ? WHERE id = ?", (*values, match["id"]))
     else:
@@ -584,7 +584,7 @@ def matches_for(sport, status="upcoming"):
     normalized = "live" if status in ("live", "in-play") else "upcoming"
     if sport in ESPN_LEAGUE_CATALOG:
         sync_espn_sport(sport)
-    stored = db().execute("SELECT * FROM matches WHERE sport = ? AND status = ? AND odds_available = 1 ORDER BY start_time ASC LIMIT 300", (sport, normalized)).fetchall()
+    stored = db().execute("SELECT * FROM matches WHERE sport = ? AND status = ? AND odds_available = TRUE ORDER BY start_time ASC LIMIT 300", (sport, normalized)).fetchall()
     if stored:
         return [stored_match_to_public(row) for row in stored]
     return []
