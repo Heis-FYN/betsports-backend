@@ -508,6 +508,8 @@ def _display_odds(value):
 def _espn_moneyline(odds, side):
     moneyline = odds.get("moneyline") or {}
     market = moneyline.get(side) or {}
+    if side == "draw":
+        market = odds.get("drawOdds") or market
     close = market.get("close") or market.get("open") or {}
     value = close.get("odds") or market.get("odds")
     if value is None:
@@ -536,8 +538,7 @@ def _espn_event_to_match(event, sport, league):
         first = event_odds[0]
         odds["home"] = _espn_moneyline(first, "home")
         odds["away"] = _espn_moneyline(first, "away")
-        draw_moneyline = (first.get("drawOdds") or {}).get("moneyLine") if isinstance(first.get("drawOdds"), dict) else first.get("drawMoneyLine")
-        odds["draw"] = _american_to_decimal(draw_moneyline)
+        odds["draw"] = _espn_moneyline(first, "draw")
     opaque_id = "m-" + hashlib.sha256(f"{sport}:{league}:{event_id}".encode()).hexdigest()[:20]
     return {
         "id": opaque_id, "sport": sport, "league": (event.get("league") or {}).get("name") or league,
