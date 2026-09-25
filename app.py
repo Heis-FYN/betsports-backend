@@ -4,6 +4,7 @@ import os
 import secrets
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from datetime import datetime, timezone
@@ -181,8 +182,26 @@ def _rest_rows(table):
         return [_frontend_profile(user)] if user else []
     if table == "matches":
         rows = []
-        for sport in SPORTS:
-            for state in ("live", "upcoming"):
+        sport_filter = request.args.get("sport", "")
+        if sport_filter.startswith("eq."):
+            requested_sport = sport_filter[3:]
+            selected_sports = [requested_sport] if requested_sport in SPORTS else []
+        else:
+            selected_sports = SPORTS
+        status_filter = request.args.get("status", "")
+        live_filter = request.args.get("is_live", "")
+        if status_filter.startswith("eq.") and status_filter[3:] in {"live", "in-play"}:
+            selected_states = ("live",)
+        elif status_filter.startswith("eq.") and status_filter[3:] in {"upcoming", "pre"}:
+            selected_states = ("upcoming",)
+        elif live_filter == "eq.true":
+            selected_states = ("live",)
+        elif live_filter == "eq.false":
+            selected_states = ("upcoming",)
+        else:
+            selected_states = ("live", "upcoming")
+        for sport in selected_sports:
+            for state in selected_states:
                 for match in matches_for(sport, state):
                     rows.append({"id": match["id"], "sport": sport, "league": match["league"], "home_team": match["homeTeam"]["name"], "away_team": match["awayTeam"]["name"], "home_team_id": match["homeTeam"]["id"], "away_team_id": match["awayTeam"]["id"], "status": match["status"], "is_live": match["isLive"], "start_time": match["startTime"], "home_odds": match["odds"]["home"], "draw_odds": match["odds"]["draw"], "away_odds": match["odds"]["away"], "home_score": match["score"]["home"], "away_score": match["score"]["away"]})
         return rows
@@ -202,11 +221,15 @@ def _apply_rest_filters(rows):
     for key, values in request.args.items(multi=True):
         if key in {"select", "order", "limit", "offset"}:
             continue
-        if "=" in values:
-            op, value = values.split("=", 1)
-            if op == "eq": rows = [r for r in rows if str(r.get(key, "")) == value]
-            elif op == "neq": rows = [r for r in rows if str(r.get(key, "")) != value]
-            elif op == "in": rows = [r for r in rows if str(r.get(key, "")) in value.strip("()").split(",")]
+        if "." in values:
+            op, value = values.split(".", 1)
+            def normalized(field_value):
+                if isinstance(field_value, bool):
+                    return "true" if field_value else "false"
+                return str(field_value if field_value is not None else "")
+            if op == "eq": rows = [r for r in rows if normalized(r.get(key, "")).lower() == value.lower()]
+            elif op == "neq": rows = [r for r in rows if normalized(r.get(key, "")).lower() != value.lower()]
+            elif op == "in": rows = [r for r in rows if normalized(r.get(key, "")).lower() in [item.lower() for item in value.strip("()").split(",")]]
     order = request.args.get("order")
     if order:
         key, _, direction = order.partition(".")
@@ -589,10 +612,12 @@ def sync_espn_sport(sport, force=False):
             return
         _espn_cache[sport] = now
     leagues = ESPN_LEAGUE_CATALOG.get(sport, [])
-    for league in leagues:
-        for match in _fetch_espn_league(sport, league):
-            if match:
-                _upsert_ingested_match(match)
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(leagues)))) as executor:
+        league_matches = executor.map(lambda league: _fetch_espn_league(sport, league), leagues)
+        for matches in league_matches:
+            for match in matches:
+                if match:
+                    _upsert_ingested_match(match)
     db().commit()
 
 
